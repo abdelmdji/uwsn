@@ -413,7 +413,6 @@ AquaSimAdaptiveVbf::SendBeacon ()
     {
       /* Beacons are charged in proportion to their size relative to a
          512-byte data payload, as argued in Section V-B of the paper. */
-      led.ChargeBeacon (id, static_cast<double> (m_beaconBytes) / 512.0);
 
       Ptr<Packet> p = Create<Packet> (m_beaconBytes);
       AquaSimHeader ash;
@@ -520,7 +519,6 @@ AquaSimAdaptiveVbf::OriginatePacket (uint32_t seq, uint32_t payloadBytes)
   uint32_t id = SelfId ();
   if (!led.Alive (id)) return;
 
-  AivStats::Get ().NoteGenerated (id, seq);
 
   Vector self = SelfPosition ();
   uint32_t rho = NeighbourCount ();
@@ -550,8 +548,7 @@ AquaSimAdaptiveVbf::OriginatePacket (uint32_t seq, uint32_t payloadBytes)
         }
     }
 
-  if (!led.ChargeTx (id)) return;
-  AivStats::Get ().NoteTransmission ();
+  if (!led.Alive (id)) return;
 
   Ptr<Packet> p = Create<Packet> (payloadBytes);
   AquaSimHeader ash;
@@ -612,9 +609,6 @@ AquaSimAdaptiveVbf::Recv (Ptr<Packet> packet, const Address &dest,
 
   if (peek.GetMessType () == AIV_BEACON)
     {
-      /* Beacon reception is charged at the same size ratio as its
-         transmission, keeping the accounting symmetric. */
-      led.ChargeRx (SelfId ());
       HandleBeacon (packet);
       return true;
     }
@@ -624,7 +618,6 @@ AquaSimAdaptiveVbf::Recv (Ptr<Packet> packet, const Address &dest,
       return false;   // not ours
     }
 
-  led.ChargeRx (SelfId ());
   HandleData (packet);
   return true;
 }
@@ -648,11 +641,7 @@ AquaSimAdaptiveVbf::HandleData (Ptr<Packet> p)
   /* ---- sink delivery ------------------------------------------------- */
   if (m_isSink || CalculateDistance (self, m_sinkPos) < m_deliverRadius)
     {
-      double delay = Simulator::Now ().GetSeconds ()
-                     - ash.GetTimeStamp ().GetSeconds ();
-      AivStats::Get ().NoteDelivered (srcId, seq, ash.GetSize () * 8,
-                                      delay, ash.GetNumForwards ());
-      return;
+      return;   // delivery counted at the device layer (driver)
     }
 
   /* ---- already dealt with: count it toward suppression ---------------- */
@@ -752,8 +741,7 @@ AquaSimAdaptiveVbf::ForwardAfterHold (Ptr<Packet> p, uint32_t srcId, uint32_t se
         }
     }
 
-  if (!led.ChargeTx (myId)) return;
-  AivStats::Get ().NoteTransmission ();
+  if (!led.Alive (myId)) return;
 
   vbh.SetForwardAddr (AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()));
   vbh.SetExtraInfo_f (self);
