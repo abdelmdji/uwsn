@@ -1,763 +1,445 @@
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
 /*
- * Adaptive-IoUT-VBF implementation. See header for the design contract.
+ * Experiment driver for Adaptive-IoUT-VBF and its baselines.
+ *
+ * Every parameter that varies in the six scenarios of the paper is exposed
+ * on the command line, so a scenario is a sweep over one flag and nothing
+ * in the source needs editing between runs.
+ *
+ *   ./ns3 run "adaptive-iout-vbf-experiment --protocol=adaptive --nNodes=50"
+ *
+ * Protocols:  adaptive | vbf | hhvbf | dbr
+ *   'vbf'   -> AquaSimVBF with hop-by-hop disabled  (Classic-VBF)
+ *   'hhvbf' -> AquaSimVBF with hop-by-hop enabled   (HHVBF)
+ *   'dbr'   -> AquaSimDBR
+ *
+ * One line of CSV is appended per run. Aggregate over seeds with analyze.py.
  */
 
-#include "aqua-sim-routing-adaptive-vbf.h"
-#include "aqua-sim-header.h"
-#include "aqua-sim-header-routing.h"
-#include "aqua-sim-address.h"
-#include "aqua-sim-pt-tag.h"
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/pointer.h"
+#include "ns3/packet-socket-helper.h"
+#include "ns3/packet-socket-address.h"
+#include "ns3/aqua-sim-ng-module.h"
 
-#include "ns3/log.h"
-#include "ns3/double.h"
-#include "ns3/uinteger.h"
-#include "ns3/boolean.h"
-#include "ns3/vector.h"
-#include "ns3/simulator.h"
-#include "ns3/mobility-model.h"
-#include "ns3/node.h"
+#include "ns3/aqua-sim-helper.h"
+#include "ns3/aqua-sim-routing-adaptive-vbf.h"
 
-#include <cmath>
-#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <vector>
 
-namespace ns3 {
+using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE ("AquaSimAdaptiveVbf");
-NS_OBJECT_ENSURE_REGISTERED (AquaSimAdaptiveVbf);
-
-/* ===================================================================== */
-/*  Energy ledger                                                        */
-/* ===================================================================== */
-
-AivEnergyLedger&
-AivEnergyLedger::Get ()
-{
-  static AivEnergyLedger inst;
-  return inst;
-}
-
-void
-AivEnergyLedger::Configure (uint32_t nNodes, double eInit, double eTx,
-                            double eRx, double eIdlePerSec)
-{
-  m_eInit = eInit;
-  m_eTx = eTx;
-  m_eRx = eRx;
-  m_eIdle = eIdlePerSec;
-  m_energy.assign (nNodes, eInit);
-  m_lastIdleApplied = 0.0;
-  m_firstDeath = -1.0;
-}
-
-void
-AivEnergyLedger::Reset ()
-{
-  std::fill (m_energy.begin (), m_energy.end (), m_eInit);
-  m_lastIdleApplied = 0.0;
-  m_firstDeath = -1.0;
-}
-
-double
-AivEnergyLedger::Energy (uint32_t id) const
-{
-  if (id >= m_energy.size ()) return 0.0;
-  return m_energy[id];
-}
-
-double
-AivEnergyLedger::Fraction (uint32_t id) const
-{
-  if (m_eInit <= 0.0) return 0.0;
-  return std::max (0.0, Energy (id) / m_eInit);
-}
-
-bool
-AivEnergyLedger::Alive (uint32_t id) const
-{
-  return Energy (id) >= m_eTx;
-}
-
-void
-AivEnergyLedger::NoteDeath (uint32_t id)
-{
-  if (m_firstDeath < 0.0 && m_energy[id] <= 0.0)
-    {
-      m_firstDeath = Simulator::Now ().GetSeconds ();
-      NS_LOG_INFO ("First node death: node " << id << " at " << m_firstDeath << "s");
-    }
-}
-
-bool
-AivEnergyLedger::ChargeTx (uint32_t id)
-{
-  if (id >= m_energy.size ()) return false;
-  if (m_energy[id] < m_eTx) return false;
-  m_energy[id] -= m_eTx;
-  NoteDeath (id);
-  return true;
-}
-
-void
-AivEnergyLedger::ChargeRx (uint32_t id)
-{
-  if (id >= m_energy.size ()) return;
-  m_energy[id] = std::max (0.0, m_energy[id] - m_eRx);
-  NoteDeath (id);
-}
-
-void
-AivEnergyLedger::ChargeBeacon (uint32_t id, double payloadRatio)
-{
-  if (id >= m_energy.size ()) return;
-  m_energy[id] = std::max (0.0, m_energy[id] - m_eTx * payloadRatio);
-  NoteDeath (id);
-}
-
-void
-AivEnergyLedger::ApplyIdleUpTo (double now)
-{
-  double dt = now - m_lastIdleApplied;
-  if (dt <= 0.0) return;
-  for (uint32_t i = 0; i < m_energy.size (); i++)
-    {
-      m_energy[i] = std::max (0.0, m_energy[i] - m_eIdle * dt);
-      NoteDeath (i);
-    }
-  m_lastIdleApplied = now;
-}
-
-std::vector<double>
-AivEnergyLedger::Consumed () const
-{
-  std::vector<double> c;
-  c.reserve (m_energy.size ());
-  for (double e : m_energy) c.push_back (m_eInit - e);
-  return c;
-}
-
-double
-AivEnergyLedger::MeanConsumed () const
-{
-  std::vector<double> c = Consumed ();
-  if (c.empty ()) return 0.0;
-  double s = 0.0;
-  for (double v : c) s += v;
-  return s / c.size ();
-}
-
-double
-AivEnergyLedger::JainFairness () const
-{
-  std::vector<double> c = Consumed ();
-  if (c.empty ()) return 1.0;
-  double sum = 0.0, sumSq = 0.0;
-  for (double v : c) { sum += v; sumSq += v * v; }
-  if (sumSq <= 0.0) return 1.0;
-  double f = (sum * sum) / (c.size () * sumSq);
-  return std::min (1.0, std::max (0.01, f));
-}
-
-double
-AivEnergyLedger::EnergyGap () const
-{
-  double f = JainFairness ();
-  double eAvg = MeanConsumed ();
-  return (eAvg / f) - (eAvg * f);
-}
-
-/* ===================================================================== */
-/*  Statistics                                                           */
-/* ===================================================================== */
-
-AivStats&
-AivStats::Get ()
-{
-  static AivStats inst;
-  return inst;
-}
-
-void
-AivStats::Reset ()
-{
-  m_seen.clear ();
-  m_generated = m_delivered = m_duplicates = 0;
-  m_dropped = m_fallbackUsed = m_transmissions = 0;
-  m_bits = 0;
-  m_delaySum = 0.0;
-  m_hopSum = 0;
-}
-
-void
-AivStats::NoteGenerated (uint32_t, uint32_t)
-{
-  m_generated++;
-}
-
-bool
-AivStats::NoteDelivered (uint32_t src, uint32_t seq, uint32_t bits,
-                         double delaySec, uint32_t hops)
-{
-  std::pair<uint32_t,uint32_t> key (src, seq);
-  if (m_seen.count (key))
-    {
-      m_duplicates++;
-      return false;
-    }
-  m_seen.insert (key);
-  m_delivered++;
-  m_bits += bits;
-  m_delaySum += delaySec;
-  m_hopSum += hops;
-  return true;
-}
-
-double AivStats::MeanDelay () const
-{ return m_delivered ? m_delaySum / m_delivered : 0.0; }
-
-double AivStats::MeanHops () const
-{ return m_delivered ? static_cast<double> (m_hopSum) / m_delivered : 0.0; }
-
-double AivStats::Pdr () const
-{ return m_generated ? 100.0 * m_delivered / m_generated : 0.0; }
-
-double
-AivStats::ThroughputKbps (double simTime) const
-{
-  if (simTime <= 0.0) return 0.0;
-  return (static_cast<double> (m_bits) / simTime) / 1000.0;
-}
-
-/* ===================================================================== */
-/*  Routing protocol                                                     */
-/* ===================================================================== */
-
-AquaSimAdaptiveVbf::AquaSimAdaptiveVbf ()
-  : m_rBase (150.0),
-    m_rComm (250.0),
-    m_tMaxHold (0.60),
-    m_k (3),
-    m_guardNormal (5.0),
-    m_guardFallback (0.0),
-    m_deliverRadius (50.0),
-    m_maxHops (30),
-    m_epsMin (0.20),
-    m_soundSpeed (1500.0),
-    m_beaconInterval (10.0),
-    m_beaconBytes (32),
-    m_neighbourTimeout (30.0),
-    m_isSink (false),
-    m_enableAdaptation (true),
-    m_sinkPos (0, 0, 0)
-{
-  m_rand = CreateObject<UniformRandomVariable> ();
-}
-
-AquaSimAdaptiveVbf::~AquaSimAdaptiveVbf () {}
-
-TypeId
-AquaSimAdaptiveVbf::GetTypeId (void)
-{
-  static TypeId tid = TypeId ("ns3::AquaSimAdaptiveVbf")
-    .SetParent<AquaSimRouting> ()
-    .AddConstructor<AquaSimAdaptiveVbf> ()
-    .AddAttribute ("BaseRadius", "Nominal pipe radius R_base (m).",
-                   DoubleValue (150.0),
-                   MakeDoubleAccessor (&AquaSimAdaptiveVbf::m_rBase),
-                   MakeDoubleChecker<double> ())
-    .AddAttribute ("CommRange", "Acoustic communication range R_c (m).",
-                   DoubleValue (250.0),
-                   MakeDoubleAccessor (&AquaSimAdaptiveVbf::m_rComm),
-                   MakeDoubleChecker<double> ())
-    .AddAttribute ("MaxHoldTime", "T_max (s).",
-                   DoubleValue (0.60),
-                   MakeDoubleAccessor (&AquaSimAdaptiveVbf::m_tMaxHold),
-                   MakeDoubleChecker<double> ())
-    .AddAttribute ("K", "Forwarders per hop / duplicate suppression threshold.",
-                   UintegerValue (3),
-                   MakeUintegerAccessor (&AquaSimAdaptiveVbf::m_k),
-                   MakeUintegerChecker<uint32_t> ())
-    .AddAttribute ("ProgressGuard", "gamma_normal (m).",
-                   DoubleValue (5.0),
-                   MakeDoubleAccessor (&AquaSimAdaptiveVbf::m_guardNormal),
-                   MakeDoubleChecker<double> ())
-    .AddAttribute ("DeliverRadius", "Delivery zone radius (m).",
-                   DoubleValue (50.0),
-                   MakeDoubleAccessor (&AquaSimAdaptiveVbf::m_deliverRadius),
-                   MakeDoubleChecker<double> ())
-    .AddAttribute ("MaxHops", "Hop limit.",
-                   UintegerValue (30),
-                   MakeUintegerAccessor (&AquaSimAdaptiveVbf::m_maxHops),
-                   MakeUintegerChecker<uint32_t> ())
-    .AddAttribute ("BeaconInterval", "T_b (s).",
-                   DoubleValue (10.0),
-                   MakeDoubleAccessor (&AquaSimAdaptiveVbf::m_beaconInterval),
-                   MakeDoubleChecker<double> ())
-    .AddAttribute ("IsSink", "True on the surface sink node.",
-                   BooleanValue (false),
-                   MakeBooleanAccessor (&AquaSimAdaptiveVbf::m_isSink),
-                   MakeBooleanChecker ())
-    .AddAttribute ("EnableAdaptation",
-                   "If false the radius is fixed at R_base (ablation baseline).",
-                   BooleanValue (true),
-                   MakeBooleanAccessor (&AquaSimAdaptiveVbf::m_enableAdaptation),
-                   MakeBooleanChecker ())
-  ;
-  return tid;
-}
-
-int64_t
-AquaSimAdaptiveVbf::AssignStreams (int64_t stream)
-{
-  m_rand->SetStream (stream);
-  return 1;
-}
-
-void
-AquaSimAdaptiveVbf::DoDispose ()
-{
-  m_beaconEvent.Cancel ();
-  for (auto &kv : m_pending) kv.second.ev.Cancel ();
-  m_pending.clear ();
-  m_rand = 0;
-  AquaSimRouting::DoDispose ();
-}
+NS_LOG_COMPONENT_DEFINE ("AdaptiveIoutVbfExperiment");
 
 /* --------------------------------------------------------------------- */
 
-Vector
-AquaSimAdaptiveVbf::SelfPosition ()
-{
-  Ptr<MobilityModel> m = GetNetDevice ()->GetNode ()->GetObject<MobilityModel> ();
-  return m ? m->GetPosition () : Vector (0, 0, 0);
-}
+/* ---------------------------------------------------------------------
+ * Device-layer instrumentation.
+ *
+ * These handlers sit on the PHY, below routing, so they fire identically
+ * for Adaptive-IoUT-VBF, Classic-VBF, HHVBF and DBR. Putting the counters
+ * here rather than inside one protocol is what makes the comparison fair:
+ * no protocol can be measured on terms the others are not.
+ * ------------------------------------------------------------------- */
 
-uint32_t
-AquaSimAdaptiveVbf::SelfId ()
-{
-  return GetNetDevice ()->GetNode ()->GetId ();
-}
-
-/*
- * Orthogonal distance from 'cand' to the line through 'from' in the
- * direction of 'sink'  --  Eq. (10):  ||v x u|| / ||u||
- */
-double
-AquaSimAdaptiveVbf::PerpDistance (const Vector &cand, const Vector &from,
-                                  const Vector &sink)
-{
-  Vector u (sink.x - from.x, sink.y - from.y, sink.z - from.z);
-  Vector v (cand.x - from.x, cand.y - from.y, cand.z - from.z);
-  double un = std::sqrt (u.x*u.x + u.y*u.y + u.z*u.z);
-  if (un < 1e-9) return 0.0;
-  Vector c (v.y*u.z - v.z*u.y,
-            v.z*u.x - v.x*u.z,
-            v.x*u.y - v.y*u.x);
-  double cn = std::sqrt (c.x*c.x + c.y*c.y + c.z*c.z);
-  return cn / un;
-}
-
-/*
- * Geographic progress, Eq. (18): how much closer to the sink 'cand' is than
- * the node that transmitted the packet.
- */
-double
-AquaSimAdaptiveVbf::Progress (const Vector &cand, const Vector &self) const
-{
-  double dSelf = CalculateDistance (self, m_sinkPos);
-  double dCand = CalculateDistance (cand, m_sinkPos);
-  return dSelf - dCand;
-}
-
-/* delta(rho) -- Eq. (12) */
-double
-AquaSimAdaptiveVbf::DensityFactor (uint32_t rho) const
-{
-  if (rho < 3)  return 2.00;
-  if (rho <= 8) return 0.88;
-  if (rho <= 15) return 0.70;
-  if (rho <= 25) return 0.60;
-  return 0.55;
-}
-
-/* R_adaptive -- Eq. (11), bounded by Eq. (13) */
-double
-AquaSimAdaptiveVbf::AdaptiveRadius (double energyFraction, uint32_t rho) const
-{
-  if (!m_enableAdaptation) return m_rBase;
-  double eps = std::max (energyFraction, m_epsMin);
-  double r = m_rBase * (0.50 + 0.50 * eps) * DensityFactor (rho);
-  double rMin = 0.10 * m_rBase;
-  return std::min (m_rComm, std::max (rMin, r));
-}
-
-/* --------------------------------------------------------------------- */
-/*  Neighbour table                                                      */
-/* --------------------------------------------------------------------- */
-
-void
-AquaSimAdaptiveVbf::StartBeaconing ()
-{
-  double jitter = m_rand->GetValue (0.0, m_beaconInterval);
-  m_beaconEvent = Simulator::Schedule (Seconds (jitter),
-                                       &AquaSimAdaptiveVbf::SendBeacon, this);
-}
-
-void
-AquaSimAdaptiveVbf::SendBeacon ()
+static void
+PhyTx (uint32_t nodeId, Ptr<Packet> p, double)
 {
   AivEnergyLedger &led = AivEnergyLedger::Get ();
-  uint32_t id = SelfId ();
+  led.ApplyIdleUpTo (Simulator::Now ().GetSeconds ());
+  led.ChargeTx (nodeId);
+  AivStats::Get ().NoteTransmission ();
+}
 
-  if (led.Alive (id))
+static void
+PhyRx (uint32_t nodeId, Ptr<Packet> p, double)
+{
+  AivEnergyLedger &led = AivEnergyLedger::Get ();
+  led.ApplyIdleUpTo (Simulator::Now ().GetSeconds ());
+  led.ChargeRx (nodeId);
+}
+
+/* Delivery is counted from the sink's own PHY reception, where every
+   header is still intact. AquaSimHeader fields used here (source address,
+   sequence number, hop count, timestamp, size) are maintained by all
+   AquaSim routing protocols, so this works for the baselines too. */
+static void
+SinkRx (Ptr<Packet> p, double)
+{
+  Ptr<Packet> copy = p->Copy ();
+  AquaSimHeader ash;
+  if (copy->GetSize () < ash.GetSerializedSize ()) return;
+  copy->RemoveHeader (ash);
+
+  uint32_t src = static_cast<uint32_t> (ash.GetSAddr ().GetAsInt ());
+  uint32_t seq = ash.GetSeqNum ();
+  if (ash.GetSize () == 0) return;                 // control traffic
+
+  double delay = Simulator::Now ().GetSeconds ()
+                 - ash.GetTimeStamp ().GetSeconds ();
+  if (delay < 0.0) return;
+
+  AivStats::Get ().NoteDelivered (src, seq, ash.GetSize () * 8,
+                                  delay, ash.GetNumForwards ());
+}
+
+/* One traffic generator for every protocol. The offered load is therefore
+   identical by construction rather than by coincidence -- if the four
+   protocols did not generate the same number of packets, no comparison
+   between them would mean anything. */
+struct TrafficSource
+{
+  Ptr<AquaSimNetDevice> dev;
+  Ptr<AquaSimAdaptiveVbf> routing;
+  uint32_t seq;
+  Address sinkAddr;
+  uint32_t payloadBytes;
+  double interval;
+  double stopTime;
+  Ptr<UniformRandomVariable> jitter;
+};
+
+static void
+GenerateTraffic (TrafficSource *ts)
+{
+  if (Simulator::Now ().GetSeconds () >= ts->stopTime) return;
+
+  Ptr<AquaSimNetDevice> dev = ts->dev;
+  uint32_t *seq = &ts->seq;
+  uint32_t payloadBytes = ts->payloadBytes;
+  Address sinkAddr = ts->sinkAddr;
+
+  AivStats::Get ().NoteGenerated (dev->GetNode ()->GetId (), *seq);
+
+  if (ts->routing != 0)
     {
-      /* Beacons are charged in proportion to their size relative to a
-         512-byte data payload, as argued in Section V-B of the paper. */
-
-      Ptr<Packet> p = Create<Packet> (m_beaconBytes);
+      ts->routing->OriginatePacket (*seq, payloadBytes);
+    }
+  else
+    {
+      Ptr<Packet> pkt = Create<Packet> (payloadBytes);
       AquaSimHeader ash;
-      VBHeader vbh;
-      AquaSimPtTag ptag;
-
-      Vector pos = SelfPosition ();
-      vbh.SetMessType (AIV_BEACON);
-      vbh.SetSenderAddr (AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()));
-      vbh.SetExtraInfo_f (pos);
-      /* Residual energy fraction encoded in per-mille in the Range field. */
-      vbh.SetRange (static_cast<uint32_t> (led.Fraction (id) * 1000.0));
-      vbh.SetPkNum (0);
-
-      ash.SetSAddr (AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()));
-      ash.SetDAddr (AquaSimAddress::GetBroadcast ());
-      ash.SetNextHop (AquaSimAddress::GetBroadcast ());
-      ash.SetDirection (AquaSimHeader::DOWN);
+      ash.SetSize (payloadBytes);
+      ash.SetSeqNum (*seq);
+      ash.SetTimeStamp (Simulator::Now ());
+      ash.SetSAddr (AquaSimAddress::ConvertFrom (dev->GetAddress ()));
+      ash.SetDAddr (AquaSimAddress::ConvertFrom (sinkAddr));
       ash.SetNumForwards (0);
       ash.SetErrorFlag (false);
-      ash.SetSize (m_beaconBytes);
-      ash.SetTimeStamp (Simulator::Now ());
-      ptag.SetPacketType (AquaSimPtTag::PT_UWVB);
-
-      p->AddPacketTag (ptag);
-      p->AddHeader (vbh);
-      p->AddHeader (ash);
-
-      SendDown (p, AquaSimAddress::GetBroadcast (), Seconds (0.0));
+      pkt->AddHeader (ash);
+      dev->Send (pkt, sinkAddr, 0);
     }
 
-  m_beaconEvent = Simulator::Schedule (Seconds (m_beaconInterval),
-                                       &AquaSimAdaptiveVbf::SendBeacon, this);
+  (*seq)++;
+  double next = ts->interval
+                + ts->jitter->GetValue (-0.1 * ts->interval, 0.1 * ts->interval);
+  Simulator::Schedule (Seconds (next), &GenerateTraffic, ts);
 }
 
-void
-AquaSimAdaptiveVbf::HandleBeacon (Ptr<Packet> p)
+/* Periodically applies the idle drain so first-death time is detected even
+   when a node is otherwise inactive. */
+static void
+IdleTick (double period, double stopTime)
 {
-  AquaSimHeader ash;
-  VBHeader vbh;
-  p->RemoveHeader (ash);
-  p->PeekHeader (vbh);
-
-  AivNeighbour n;
-  n.addr = vbh.GetSenderAddr ();
-  n.pos = vbh.GetExtraInfo ().f;
-  n.energyFraction = vbh.GetRange () / 1000.0;
-  n.lastHeard = Simulator::Now ().GetSeconds ();
-
-  uint32_t key = static_cast<uint32_t> (n.addr.GetAsInt ());
-  m_neighbours[key] = n;
-}
-
-void
-AquaSimAdaptiveVbf::PurgeNeighbours ()
-{
-  double now = Simulator::Now ().GetSeconds ();
-  Vector self = SelfPosition ();
-  for (auto it = m_neighbours.begin (); it != m_neighbours.end (); )
-    {
-      bool stale = (now - it->second.lastHeard) > m_neighbourTimeout;
-      bool far = CalculateDistance (self, it->second.pos) > m_rComm;
-      if (stale || far) it = m_neighbours.erase (it);
-      else ++it;
-    }
-}
-
-uint32_t
-AquaSimAdaptiveVbf::NeighbourCount ()
-{
-  PurgeNeighbours ();
-  return static_cast<uint32_t> (m_neighbours.size ());
+  AivEnergyLedger::Get ().ApplyIdleUpTo (Simulator::Now ().GetSeconds ());
+  if (Simulator::Now ().GetSeconds () + period <= stopTime)
+    Simulator::Schedule (Seconds (period), &IdleTick, period, stopTime);
 }
 
 /* --------------------------------------------------------------------- */
-/*  Candidate check used by the forwarder for fallback decisions          */
-/* --------------------------------------------------------------------- */
 
-bool
-AquaSimAdaptiveVbf::AnyCandidate (double radius, double guard)
+int
+main (int argc, char *argv[])
 {
-  Vector self = SelfPosition ();
-  for (const auto &kv : m_neighbours)
-    {
-      const AivNeighbour &n = kv.second;
-      if (CalculateDistance (self, n.pos) > m_rComm) continue;
-      if (PerpDistance (n.pos, self, m_sinkPos) > radius) continue;
-      if (Progress (n.pos, self) <= guard) continue;
-      return true;
-    }
-  return false;
-}
+  /* ---- defaults: the paper's Table II ------------------------------- */
+  std::string protocol   = "adaptive";
+  uint32_t nNodes        = 50;
+  uint32_t nSources      = 5;
+  double   fieldSize     = 500.0;    // horizontal extent (m)
+  double   waterDepth    = 500.0;    // vertical extent (m)
+  double   maxSpeed      = 3.0;      // m/s
+  double   basePipeR     = 150.0;    // m
+  double   commRange     = 250.0;    // m
+  double   packetInterval= 6.0;      // s
+  uint32_t payloadBytes  = 512;
+  double   simTime       = 200.0;    // s
+  double   bitRate       = 10000.0;  // bps  (AquaSim-NG default)
+  double   frequency     = 25.0;     // kHz
+  double   initialEnergy = 100.0;    // J
+  double   eTx           = 0.50;     // J per transmission
+  double   eRx           = 0.10;     // J per reception
+  double   eIdle         = 0.001;    // J/s
+  uint32_t seed          = 1;
+  uint32_t k             = 3;
+  double   tMaxHold      = 0.60;
+  bool     runToDeath    = false;    // if true, ignore simTime cap
+  std::string outFile    = "results.csv";
+  std::string label      = "";
 
-/* --------------------------------------------------------------------- */
-/*  Origination                                                          */
-/* --------------------------------------------------------------------- */
+  CommandLine cmd;
+  cmd.AddValue ("protocol",       "adaptive | vbf | hhvbf | dbr", protocol);
+  cmd.AddValue ("nNodes",         "Number of sensor nodes", nNodes);
+  cmd.AddValue ("nSources",       "Number of traffic-generating nodes", nSources);
+  cmd.AddValue ("fieldSize",      "Horizontal field side length (m)", fieldSize);
+  cmd.AddValue ("waterDepth",     "Vertical field extent (m)", waterDepth);
+  cmd.AddValue ("maxSpeed",       "Maximum node speed (m/s)", maxSpeed);
+  cmd.AddValue ("basePipeR",      "Base pipe radius R_base (m)", basePipeR);
+  cmd.AddValue ("commRange",      "Acoustic range R_c (m)", commRange);
+  cmd.AddValue ("packetInterval", "Packet generation interval (s)", packetInterval);
+  cmd.AddValue ("payloadBytes",   "Data payload size (bytes)", payloadBytes);
+  cmd.AddValue ("simTime",        "Simulation duration (s)", simTime);
+  cmd.AddValue ("bitRate",        "Acoustic bit rate (bps)", bitRate);
+  cmd.AddValue ("frequency",      "Carrier frequency (kHz)", frequency);
+  cmd.AddValue ("initialEnergy",  "Initial node energy (J)", initialEnergy);
+  cmd.AddValue ("eTx",            "Transmission energy (J)", eTx);
+  cmd.AddValue ("eRx",            "Reception energy (J)", eRx);
+  cmd.AddValue ("eIdle",          "Idle drain (J/s)", eIdle);
+  cmd.AddValue ("seed",           "RNG run number", seed);
+  cmd.AddValue ("K",              "Forwarders per hop", k);
+  cmd.AddValue ("tMaxHold",       "Maximum holding time (s)", tMaxHold);
+  cmd.AddValue ("runToDeath",     "Run until first node death", runToDeath);
+  cmd.AddValue ("outFile",        "CSV output path", outFile);
+  cmd.AddValue ("label",          "Free-text tag for the sweep", label);
+  cmd.Parse (argc, argv);
 
-void
-AquaSimAdaptiveVbf::OriginatePacket (uint32_t seq, uint32_t payloadBytes)
-{
-  AivEnergyLedger &led = AivEnergyLedger::Get ();
-  led.ApplyIdleUpTo (Simulator::Now ().GetSeconds ());
+  if (runToDeath) simTime = 20000.0;   // generous ceiling; loop exits on death
 
-  uint32_t id = SelfId ();
-  if (!led.Alive (id)) return;
+  RngSeedManager::SetSeed (12345);
+  RngSeedManager::SetRun (seed);
 
+  /* ---- energy + stats ------------------------------------------------ */
+  AivEnergyLedger::Get ().Configure (nNodes, initialEnergy, eTx, eRx, eIdle);
+  AivStats::Get ().Reset ();
 
-  Vector self = SelfPosition ();
-  uint32_t rho = NeighbourCount ();
-  double radius = AdaptiveRadius (led.Fraction (id), rho);
-  double guard = m_guardNormal;
+  /* ---- nodes and mobility -------------------------------------------- */
+  NodeContainer nodes;
+  nodes.Create (nNodes);
 
-  /* Three-stage fallback void recovery, Eq. (18). */
-  if (!AnyCandidate (radius, guard))
-    {
-      const double stages[3] = { 1.5 * radius, 2.0 * m_rBase, 3.0 * m_rBase };
-      bool found = false;
-      for (int s = 0; s < 3 && !found; s++)
-        {
-          double r = std::min (stages[s], m_rComm);
-          if (AnyCandidate (r, m_guardFallback))
-            {
-              radius = r;
-              guard = m_guardFallback;
-              found = true;
-              AivStats::Get ().NoteVoidFallback ();
-            }
-        }
-      if (!found)
-        {
-          AivStats::Get ().NoteDropped ();
-          return;
-        }
-    }
-
-  if (!led.Alive (id)) return;
-
-  Ptr<Packet> p = Create<Packet> (payloadBytes);
-  AquaSimHeader ash;
-  VBHeader vbh;
-  AquaSimPtTag ptag;
-
-  vbh.SetMessType (AIV_DATA);
-  vbh.SetPkNum (seq);
-  vbh.SetSenderAddr (AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()));
-  vbh.SetForwardAddr (AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()));
-  vbh.SetOriginalSource (self);
-  vbh.SetExtraInfo_o (self);   // original source
-  vbh.SetExtraInfo_f (self);   // this forwarder
-  vbh.SetExtraInfo_t (m_sinkPos);
-  /* R_adaptive and the active progress guard travel in the header. */
-  vbh.SetRange (static_cast<uint32_t> (radius * 100.0));
-  vbh.SetToken (static_cast<uint32_t> (guard * 100.0));
-
-  ash.SetSAddr (AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()));
-  ash.SetDAddr (AquaSimAddress::GetBroadcast ());
-  ash.SetNextHop (AquaSimAddress::GetBroadcast ());
-  ash.SetDirection (AquaSimHeader::DOWN);
-  ash.SetNumForwards (0);
-  ash.SetErrorFlag (false);
-  ash.SetSize (payloadBytes);
-  ash.SetTimeStamp (Simulator::Now ());
-  ash.SetSeqNum (seq);
-  ptag.SetPacketType (AquaSimPtTag::PT_UWVB);
-
-  p->AddPacketTag (ptag);
-  p->AddHeader (vbh);
-  p->AddHeader (ash);
-
-  m_handled.insert (std::make_pair (id, seq));
-  SendDown (p, AquaSimAddress::GetBroadcast (), Seconds (0.0));
-}
-
-/* --------------------------------------------------------------------- */
-/*  Reception  --  Algorithm 1, Part B                                    */
-/* --------------------------------------------------------------------- */
-
-bool
-AquaSimAdaptiveVbf::Recv (Ptr<Packet> packet, const Address &dest,
-                          uint16_t protocolNumber)
-{
-  if (packet == 0) return false;
-
-  AivEnergyLedger &led = AivEnergyLedger::Get ();
-  led.ApplyIdleUpTo (Simulator::Now ().GetSeconds ());
-
-  VBHeader peek;
+  MobilityHelper mobility;
   {
-    Ptr<Packet> copy = packet->Copy ();
-    AquaSimHeader tmp;
-    copy->RemoveHeader (tmp);
-    copy->PeekHeader (peek);
+    std::ostringstream xy, z, spd;
+    xy  << "ns3::UniformRandomVariable[Min=0|Max=" << fieldSize << "]";
+    z   << "ns3::UniformRandomVariable[Min=0|Max=" << waterDepth << "]";
+    spd << "ns3::UniformRandomVariable[Min=0|Max=" << maxSpeed << "]";
+
+    mobility.SetPositionAllocator ("ns3::RandomBoxPositionAllocator",
+                                   "X", StringValue (xy.str ()),
+                                   "Y", StringValue (xy.str ()),
+                                   "Z", StringValue (z.str ()));
+    /* Three-dimensional Random Waypoint, as specified in the paper.
+       RandomWaypointMobilityModel draws each successive waypoint from its
+       PositionAllocator, so a RandomBoxPositionAllocator gives genuinely
+       3-D motion. (ns-3 has no RandomWalk3dMobilityModel; RandomWalk2d
+       would pin the depth coordinate, which is exactly the flaw we are
+       trying to avoid.) */
+    Ptr<RandomBoxPositionAllocator> waypoints =
+      CreateObject<RandomBoxPositionAllocator> ();
+    {
+      Ptr<UniformRandomVariable> ux = CreateObject<UniformRandomVariable> ();
+      ux->SetAttribute ("Min", DoubleValue (0.0));
+      ux->SetAttribute ("Max", DoubleValue (fieldSize));
+      Ptr<UniformRandomVariable> uy = CreateObject<UniformRandomVariable> ();
+      uy->SetAttribute ("Min", DoubleValue (0.0));
+      uy->SetAttribute ("Max", DoubleValue (fieldSize));
+      Ptr<UniformRandomVariable> uz = CreateObject<UniformRandomVariable> ();
+      uz->SetAttribute ("Min", DoubleValue (0.0));
+      uz->SetAttribute ("Max", DoubleValue (waterDepth));
+      waypoints->SetX (ux);
+      waypoints->SetY (uy);
+      waypoints->SetZ (uz);
+    }
+    mobility.SetMobilityModel ("ns3::RandomWaypointMobilityModel",
+                               "Speed", StringValue (spd.str ()),
+                               "Pause",
+                               StringValue ("ns3::ConstantRandomVariable[Constant=0.0]"),
+                               "PositionAllocator", PointerValue (waypoints));
+    mobility.Install (nodes);
   }
 
-  if (peek.GetMessType () == AIV_BEACON)
+  /* Node 0 is the surface sink: fixed, centred, at depth 0. */
+  Vector sinkPos (fieldSize / 2.0, fieldSize / 2.0, 0.0);
+  nodes.Get (0)->GetObject<MobilityModel> ()->SetPosition (sinkPos);
+  MobilityHelper stat;
+  stat.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+  stat.Install (nodes.Get (0));
+  nodes.Get (0)->GetObject<MobilityModel> ()->SetPosition (sinkPos);
+
+  /* ---- channel, PHY, MAC --------------------------------------------- */
+  AquaSimChannelHelper channelHelper = AquaSimChannelHelper::Default ();
+  channelHelper.SetPropagation ("ns3::AquaSimRangePropagation");
+
+  AquaSimHelper asHelper = AquaSimHelper::Default ();
+  asHelper.SetChannel (channelHelper.Create ());
+  asHelper.SetMac ("ns3::AquaSimBroadcastMac");
+
+  if (protocol == "adaptive")
     {
-      HandleBeacon (packet);
-      return true;
+      asHelper.SetRouting ("ns3::AquaSimAdaptiveVbf",
+                           "BaseRadius", DoubleValue (basePipeR),
+                           "CommRange", DoubleValue (commRange),
+                           "K", UintegerValue (k),
+                           "MaxHoldTime", DoubleValue (tMaxHold));
+    }
+  else if (protocol == "vbf")
+    {
+      asHelper.SetRouting ("ns3::AquaSimVBF",
+                           "Width", DoubleValue (basePipeR),
+                           "HopByHop", IntegerValue (0));
+    }
+  else if (protocol == "hhvbf")
+    {
+      asHelper.SetRouting ("ns3::AquaSimVBF",
+                           "Width", DoubleValue (basePipeR),
+                           "HopByHop", IntegerValue (1));
+    }
+  else if (protocol == "dbr")
+    {
+      asHelper.SetRouting ("ns3::AquaSimDBR");
+    }
+  else
+    {
+      NS_FATAL_ERROR ("Unknown protocol: " << protocol);
     }
 
-  if (peek.GetMessType () != AIV_DATA)
+  NetDeviceContainer devices;
+  std::vector<Ptr<AquaSimAdaptiveVbf> > aivRouting;
+
+  for (uint32_t i = 0; i < nodes.GetN (); i++)
     {
-      return false;   // not ours
-    }
+      Ptr<AquaSimNetDevice> dev = CreateObject<AquaSimNetDevice> ();
+      devices.Add (asHelper.Create (nodes.Get (i), dev));
 
-  HandleData (packet);
-  return true;
-}
+      dev->GetPhy ()->SetTransRange (commRange);
+      dev->SetAddress (AquaSimAddress (i + 1));
 
-void
-AquaSimAdaptiveVbf::HandleData (Ptr<Packet> p)
-{
-  AquaSimHeader ash;
-  VBHeader vbh;
-  p->RemoveHeader (ash);
-  p->RemoveHeader (vbh);
+      if (i == 0) dev->SetSinkStatus ();
 
-  uint32_t srcId = static_cast<uint32_t> (vbh.GetSenderAddr ().GetAsInt ());
-  uint32_t seq = vbh.GetPkNum ();
-  std::pair<uint32_t,uint32_t> key (srcId, seq);
+      /* Energy accounting for every node, every protocol. */
+      dev->GetPhy ()->TraceConnectWithoutContext (
+          "Tx", MakeBoundCallback (&PhyTx, i));
+      dev->GetPhy ()->TraceConnectWithoutContext (
+          "Rx", MakeBoundCallback (&PhyRx, i));
+      /* Delivery accounting at the sink only. */
+      if (i == 0)
+        dev->GetPhy ()->TraceConnectWithoutContext ("Rx", MakeCallback (&SinkRx));
 
-  Vector self = SelfPosition ();
-  uint32_t myId = SelfId ();
-  AivEnergyLedger &led = AivEnergyLedger::Get ();
-
-  /* ---- sink delivery ------------------------------------------------- */
-  if (m_isSink || CalculateDistance (self, m_sinkPos) < m_deliverRadius)
-    {
-      return;   // delivery counted at the device layer (driver)
-    }
-
-  /* ---- already dealt with: count it toward suppression ---------------- */
-  auto pend = m_pending.find (key);
-  if (pend != m_pending.end ())
-    {
-      pend->second.heard++;
-      if (pend->second.heard >= m_k)
+      if (protocol == "adaptive")
         {
-          pend->second.ev.Cancel ();
-          m_pending.erase (pend);
-          m_handled.insert (key);   // suppressed
-        }
-      return;
-    }
-  if (m_handled.count (key)) return;
-
-  /* ---- guards --------------------------------------------------------- */
-  if (!led.Alive (myId)) return;
-  if (ash.GetNumForwards () >= m_maxHops)
-    {
-      AivStats::Get ().NoteDropped ();
-      m_handled.insert (key);
-      return;
-    }
-
-  /* ---- eligibility against the corridor carried in the header --------- */
-  Vector prevPos = vbh.GetExtraInfo ().f;
-  double radius = vbh.GetRange () / 100.0;
-  double guard = vbh.GetToken () / 100.0;
-
-  double dPerp = PerpDistance (self, prevPos, m_sinkPos);
-  if (dPerp > radius) return;
-
-  double prog = Progress (self, prevPos);
-  if (prog <= guard) return;
-
-  /* ---- holding time, Eq. (15) ----------------------------------------- */
-  double tHold = (radius > 0.0)
-                 ? (dPerp / radius) * m_tMaxHold
-                 : m_tMaxHold;
-  tHold = std::max (0.0, std::min (m_tMaxHold, tHold));
-
-  Ptr<Packet> copy = p->Copy ();
-  copy->AddHeader (vbh);
-  copy->AddHeader (ash);
-
-  Pending entry;
-  entry.heard = 0;
-  entry.ev = Simulator::Schedule (Seconds (tHold),
-                                  &AquaSimAdaptiveVbf::ForwardAfterHold,
-                                  this, copy, srcId, seq);
-  m_pending[key] = entry;
-}
-
-void
-AquaSimAdaptiveVbf::ForwardAfterHold (Ptr<Packet> p, uint32_t srcId, uint32_t seq)
-{
-  std::pair<uint32_t,uint32_t> key (srcId, seq);
-  m_pending.erase (key);
-  m_handled.insert (key);
-
-  AivEnergyLedger &led = AivEnergyLedger::Get ();
-  led.ApplyIdleUpTo (Simulator::Now ().GetSeconds ());
-
-  uint32_t myId = SelfId ();
-  if (!led.Alive (myId)) return;
-
-  AquaSimHeader ash;
-  VBHeader vbh;
-  p->RemoveHeader (ash);
-  p->RemoveHeader (vbh);
-
-  Vector self = SelfPosition ();
-  uint32_t rho = NeighbourCount ();
-  double radius = AdaptiveRadius (led.Fraction (myId), rho);
-  double guard = m_guardNormal;
-
-  /* Three-stage fallback void recovery, Eq. (18). */
-  if (!AnyCandidate (radius, guard))
-    {
-      const double stages[3] = { 1.5 * radius, 2.0 * m_rBase, 3.0 * m_rBase };
-      bool found = false;
-      for (int s = 0; s < 3 && !found; s++)
-        {
-          double r = std::min (stages[s], m_rComm);
-          if (AnyCandidate (r, m_guardFallback))
+          Ptr<AquaSimAdaptiveVbf> r =
+            DynamicCast<AquaSimAdaptiveVbf> (dev->GetRouting ());
+          NS_ASSERT (r != 0);
+          r->SetSinkPosition (sinkPos);
+          r->AssignStreams (100 + i);
+          if (i == 0)
             {
-              radius = r; guard = m_guardFallback; found = true;
-              AivStats::Get ().NoteVoidFallback ();
+              r->SetAttribute ("IsSink", BooleanValue (true));
             }
+          r->StartBeaconing ();
+          aivRouting.push_back (r);
         }
-      if (!found)
+      else
         {
-          AivStats::Get ().NoteDropped ();
-          return;
+          Ptr<AquaSimVBF> v = DynamicCast<AquaSimVBF> (dev->GetRouting ());
+          if (v) v->SetTargetPos (sinkPos);
+          aivRouting.push_back (0);
         }
     }
 
-  if (!led.Alive (myId)) return;
+  /* Packet sockets are required for the baseline traffic path; without
+     this the socket factory is absent and Socket::CreateSocket returns
+     null (segfault on Connect). */
+  PacketSocketHelper packetSocket;
+  packetSocket.Install (nodes);
 
-  vbh.SetForwardAddr (AquaSimAddress::ConvertFrom (GetNetDevice ()->GetAddress ()));
-  vbh.SetExtraInfo_f (self);
-  vbh.SetRange (static_cast<uint32_t> (radius * 100.0));
-  vbh.SetToken (static_cast<uint32_t> (guard * 100.0));
+  /* ---- traffic -------------------------------------------------------- */
+  Ptr<UniformRandomVariable> jitter = CreateObject<UniformRandomVariable> ();
+  jitter->SetStream (7);
 
-  ash.SetNumForwards (ash.GetNumForwards () + 1);
-  ash.SetNextHop (AquaSimAddress::GetBroadcast ());
-  ash.SetDAddr (AquaSimAddress::GetBroadcast ());
-  ash.SetDirection (AquaSimHeader::DOWN);
-  ash.SetErrorFlag (false);
+  uint32_t sources = std::min (nSources, nNodes - 1);
+  Address sinkAddr = devices.Get (0)->GetAddress ();
+  std::vector<TrafficSource *> trafficSources;
 
-  p->AddHeader (vbh);
-  p->AddHeader (ash);
+  for (uint32_t s = 1; s <= sources; s++)
+    {
+      uint32_t idx = 1 + (s - 1) * ((nNodes - 1) / sources);
+      if (idx >= nNodes) idx = nNodes - 1;
 
-  SendDown (p, AquaSimAddress::GetBroadcast (), Seconds (0.0));
+      TrafficSource *ts = new TrafficSource ();
+      ts->dev = DynamicCast<AquaSimNetDevice> (devices.Get (idx));
+      ts->routing = aivRouting[idx];
+      ts->seq = 0;
+      ts->sinkAddr = sinkAddr;
+      ts->payloadBytes = payloadBytes;
+      ts->interval = packetInterval;
+      ts->stopTime = simTime;
+      ts->jitter = jitter;
+      trafficSources.push_back (ts);
+
+      Simulator::Schedule (Seconds (5.0 + 0.37 * s), &GenerateTraffic, ts);
+    }
+
+  Simulator::Schedule (Seconds (1.0), &IdleTick, 1.0, simTime);
+
+  Simulator::Stop (Seconds (simTime));
+  Simulator::Run ();
+
+  double endTime = Simulator::Now ().GetSeconds ();
+  AivEnergyLedger::Get ().ApplyIdleUpTo (endTime);
+  Simulator::Destroy ();
+
+  /* ---- results -------------------------------------------------------- */
+  AivEnergyLedger &led = AivEnergyLedger::Get ();
+  AivStats &st = AivStats::Get ();
+
+  bool censored = !led.AnyDeath ();
+  double lifetime = censored ? -1.0 : led.FirstDeathTime ();
+
+  bool header = false;
+  {
+    std::ifstream probe (outFile.c_str ());
+    header = !probe.good () || probe.peek () == std::ifstream::traits_type::eof ();
+  }
+
+  std::ofstream out (outFile.c_str (), std::ios_base::app);
+  if (header)
+    {
+      out << "label,protocol,seed,nNodes,nSources,fieldSize,waterDepth,maxSpeed,"
+          << "basePipeR,commRange,packetInterval,payloadBytes,bitRate,simTime,"
+          << "generated,delivered,duplicates,dropped,transmissions,fallbacks,"
+          << "pdr_pct,throughput_kbps,mean_delay_s,mean_hops,"
+          << "lifetime_s,lifetime_censored,jain_fairness,energy_gap_J,"
+          << "mean_consumed_J\n";
+    }
+
+  out << std::fixed << std::setprecision (6)
+      << label << "," << protocol << "," << seed << "," << nNodes << ","
+      << sources << "," << fieldSize << "," << waterDepth << "," << maxSpeed << ","
+      << basePipeR << "," << commRange << "," << packetInterval << ","
+      << payloadBytes << "," << bitRate << "," << endTime << ","
+      << st.Generated () << "," << st.Delivered () << "," << st.Duplicates () << ","
+      << st.Dropped () << "," << st.Transmissions () << "," << st.Fallbacks () << ","
+      << st.Pdr () << "," << st.ThroughputKbps (endTime) << ","
+      << st.MeanDelay () << "," << st.MeanHops () << ","
+      << lifetime << "," << (censored ? 1 : 0) << ","
+      << led.JainFairness () << "," << led.EnergyGap () << ","
+      << led.MeanConsumed () << "\n";
+  out.close ();
+
+  std::cout << protocol << " seed=" << seed
+            << " PDR=" << st.Pdr () << "%"
+            << " thr=" << st.ThroughputKbps (endTime) << "kbps"
+            << " hops=" << st.MeanHops ()
+            << " delay=" << st.MeanDelay () << "s"
+            << " lifetime=" << (censored ? std::string ("CENSORED")
+                                         : std::to_string (lifetime))
+            << " gap=" << led.EnergyGap () << "J"
+            << std::endl;
+
+  return 0;
 }
-
-} // namespace ns3
