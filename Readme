@@ -1,0 +1,125 @@
+Adaptive-IoUT-VBF
+
+NS-3.36 / AquaSim-NG implementation and complete simulation results for:
+
+A. Benarfa, N. Azzouz, S. N. Ben Messaoud, "Adaptive-IoUT-VBF: A Density-Aware Dynamic Routing Protocol for High-Throughput and Energy-Efficient Internet of Underwater Things", submitted to Ad Hoc Networks, 2026.
+
+Department of Computer Science, Faculty of Sciences, Amar Telidji University of Laghouat, Algeria.
+
+Everything needed to reproduce every figure in the paper is here: the protocol source, the experiment driver, the sweep runner, the analysis script, and the raw per-run output of all 6,400 simulation runs.
+
+What the protocol does
+
+Vector-Based Forwarding confines relaying to a cylindrical "pipe" drawn from source to sink, bounded by a radius fixed at deployment time. That radius cannot respond to a topology that drifts with the current: too narrow and packets fall into voids, too wide and the channel fills with redundant transmissions.
+
+Adaptive-IoUT-VBF sets the radius per hop from two quantities the forwarder already holds:
+
+R_adaptive = R_base x (0.50 + 0.50 x eps_i) x delta(rho_i)
+
+where eps_i is the node's residual energy fraction (floored at 0.20) and delta(rho_i) is a piecewise factor of its one-hop neighbour count: 2.00 when fewer than three neighbours are reachable, falling to 0.55 above 25. Relay priority then emerges from a holding timer proportional to each candidate's orthogonal distance from the pipe axis, with counter-based suppression admitting at most K = 3 forwarders per hop. When no candidate qualifies, a three-stage fallback widens the search radius and relaxes the progress guard before the packet is dropped.
+
+Every forwarding decision is taken by the node that acts on it. No node schedules a transmission at another node, and the only state maintained is a one-hop neighbour table refreshed by periodic beacons.
+
+Repository contents
+File	Purpose
+aqua-sim-routing-adaptive-vbf.h / .cc	The protocol. Subclasses AquaSimRouting.
+adaptive-iout-vbf-experiment.cc	Experiment driver; every swept parameter is a CLI flag.
+run_resumable.py	Parallel sweep runner; skips completed runs, resumable.
+run_lifetime.sh	Run-to-depletion sweep.
+analyze.py	Aggregates to means with 95% CIs and draws the figures.
+patch_gcc13.py, fixcstdint.py	Build fix for GCC 13+ (see below).
+results/	Raw per-run output, R_c = 250 m.
+results_r120/	Raw per-run output, R_c = 120 m -- the configuration reported in the paper.
+Which results directory the paper uses
+
+results_r120/. At R_c = 250 m in a 500 m field the network is nearly fully connected: over 80% of packets reach the sink in a single hop and average hop count falls below 0.6, so multi-hop routing is barely exercised. Both configurations were swept in full and the ordering of the protocols is the same in each; the sparser one is reported because it is the regime in which a routing protocol is actually under test. results/ is included so that claim can be checked.
+
+Building
+
+Requires ns-3.36 specifically -- AquaSim-NG does not build against newer ns-3 releases without patching.
+
+bash
+sudo apt install -y g++ python3 python3-dev cmake ninja-build git \
+                    pkg-config libsqlite3-dev
+
+git clone --branch ns-3.36 https://gitlab.com/nsnam/ns-3-dev.git
+cd ns-3-dev
+git clone https://github.com/rmartin5/aqua-sim-ng.git contrib/aqua-sim-ng
+
+cp aqua-sim-routing-adaptive-vbf.h  contrib/aqua-sim-ng/model/
+cp aqua-sim-routing-adaptive-vbf.cc contrib/aqua-sim-ng/model/
+cp adaptive-iout-vbf-experiment.cc  scratch/
+
+Register the module by adding these two lines to contrib/aqua-sim-ng/CMakeLists.txt, next to the existing VBF entries:
+
+cmake
+model/aqua-sim-routing-adaptive-vbf.cc   # to source_files
+model/aqua-sim-routing-adaptive-vbf.h    # to header_files
+
+Then:
+
+bash
+./ns3 configure --enable-modules=aqua-sim-ng --build-profile=optimized
+./ns3 build
+If you are on GCC 13 or newer
+
+ns-3.36 predates GCC 13, which stopped including <cstdint> transitively. Several ns-3 headers fail with 'uint8_t' was not declared. Run:
+
+bash
+python3 patch_gcc13.py $PWD
+
+It loops -- build, find the offending header, insert the include, repeat -- until the build completes. Three headers needed it on Ubuntu 24.04. Ubuntu 22.04 (GCC 11) is unaffected.
+
+Reproducing the results
+bash
+# single run
+./ns3 run "adaptive-iout-vbf-experiment --protocol=adaptive --nNodes=50 \
+           --seed=1 --commRange=120"
+
+# full sweep: 6 scenarios x 4 protocols x 20 seeds = 3,200 runs
+python3 run_resumable.py --seeds 20 --jobs $(nproc) --outdir results_r120
+
+# figures and confidence intervals
+python3 analyze.py results_r120/
+
+--protocol takes adaptive, vbf (Classic-VBF), hhvbf, or dbr. The baselines are AquaSim-NG's own AquaSimVBF and AquaSimDBR, not reimplementations.
+
+Sanity checks
+
+Worth running before trusting a sweep:
+
+bash
+# 1. relaying actually happens: mean_hops must exceed 1
+./ns3 run "adaptive-iout-vbf-experiment --protocol=adaptive --nNodes=50 --commRange=120"
+
+# 2. offered load is identical across protocols
+cut -d, -f2,15 results_r120/s1_density.csv | sort -u | head
+
+The second matters most. All four protocols generate traffic through one code path in the driver, so generated is equal by construction rather than by coincidence. If it ever differs at the same --packetInterval, the comparison is invalid.
+
+How the measurements are taken
+
+Instrumentation sits at the device layer, on the PHY's Tx and Rx trace sources, below routing. It therefore fires identically for all four protocols; no protocol is measured on terms the others are not.
+
+Energy -- fixed per-event costs as specified in the paper: E_TX = 0.50 J, E_RX = 0.10 J, E_idle = 0.001 J/s, E_init = 100 J. Charged from the PHY traces, so relays and originators are treated alike.
+Delivery -- counted at the sink's own PHY reception, where headers are still intact. Deduplicated by (source, sequence), since K > 1 forwarding necessarily produces duplicates.
+Hop count -- AquaSimHeader::GetNumForwards() at the sink, a field all AquaSim routing protocols maintain.
+Energy gap -- dE = E_avg/F - E_avg*F with F Jain's fairness index over consumed energy. jain_fairness is also written out directly.
+Lifetime -- no ceiling is applied. lifetime_s records first node death and lifetime_censored flags configurations where no node depleted within the window. The paper's lifetime figures are projected from the measured consumption rate, E_init divided by the per-node drain, because no node depletes within 200 s.
+CSV columns
+
+One row per run. Key columns: protocol, seed, the swept parameter, generated, delivered, duplicates, dropped, transmissions, fallbacks, pdr_pct, throughput_kbps, mean_delay_s, mean_hops, lifetime_s, lifetime_censored, jain_fairness, energy_gap_J, mean_consumed_J.
+
+results_*/analysis/summary_*.csv holds the aggregated means, 95% confidence intervals, and run counts per point -- these are the numbers plotted in the paper.
+
+Known limitations
+
+Stated in full in Section VII-C of the paper. The ones that bear most directly on reuse of this code:
+
+The energy model charges every transmission equally regardless of distance. This does not penalise the longer links a widened pipe may induce, and is therefore directionally favourable to the proposed protocol. Results are best read as a comparison of forwarding-load distribution rather than an absolute prediction of joules.
+Classic-VBF and HHVBF register exactly 1.0 average hops at densities above 50 nodes in this configuration -- they deliver only from sources already within acoustic range of the sink. The comparison is thus between a working multi-hop protocol and baselines that are largely failing to relay.
+The adaptation constants in delta(rho) were hand-tuned, not systematically optimised, and delta is discontinuous at the sparse threshold.
+Mobility uses 3-D Random Waypoint, which does not reproduce the spatial correlation or depth stratification of real ocean currents.
+License and contact
+
+Code released for reproduction and reuse; please cite the paper above. Correspondence: Abdelmadjid Benarfa -- a.benarfa@lagh-univ.dz
